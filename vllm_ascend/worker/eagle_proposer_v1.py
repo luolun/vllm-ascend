@@ -16,6 +16,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
 PADDING_SLOT_ID = -1
 
@@ -78,11 +79,10 @@ class EagleProposer:
     def _make_attention_mask(
         self,
         seq_lens,
-        query_lens,
         position,
     ) -> torch.Tensor:
         return self.attn_mask_builder.get_splitfuse_attn_mask(
-            seq_lens, query_lens, position, self.dtype, self.device)
+            seq_lens, position, self.dtype, self.device)
 
     def propose(
         self,
@@ -125,12 +125,27 @@ class EagleProposer:
         query_lens = cu_num_tokens[1:] - cu_num_tokens[:-1]
         max_query_len = query_lens.max().item()
 
-        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
-        attn_metadata = self.runner.attn_metadata_builder.build(
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=self.runner.query_start_loc[:batch_size + 1],
+            query_start_loc_cpu=self.runner.query_start_loc_cpu[:batch_size +
+                                                                1],
+            seq_lens_cpu=self.runner.seq_lens_cpu,
+            max_query_len=max_query_len,
             num_reqs=batch_size,
             num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
+            actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
+            block_table_tensor=self.runner.input_batch.block_table[0].
+            get_device_tensor(),
+            slot_mapping_cpu=target_slot_mapping,
+            positions=target_positions,
+            attn_mask=self.runner.attn_mask,
+            spec_attn_mask=self.runner.spec_attn_mask,
+            attn_state=self.runner.attn_state,
+            decode_token_per_req=self.runner.decode_token_per_req,
         )
+        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
+        attn_metadata = self.runner.attn_metadata_builder.build(
+            common_attn_metadata, self.runner.model)
         if self.use_cuda_graph and \
             num_tokens <= self.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
@@ -231,7 +246,6 @@ class EagleProposer:
             positions = positions_cpu.to(device)
             attn_mask = self._make_attention_mask(
                 seq_lens=attn_metadata.seq_lens,
-                query_lens=attn_metadata.max_query_len,
                 position=positions,
             )
             attn_metadata.attn_mask = attn_mask
