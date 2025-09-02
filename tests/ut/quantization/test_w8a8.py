@@ -5,12 +5,13 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ops.layers.experts_selector import (_native_grouped_topk,
+                                                     select_experts)
 from vllm_ascend.quantization.w8a8 import (AscendC8KVCacheMethod,
                                            AscendW8A8FusedMoEMethod,
                                            AscendW8A8LinearMethod,
                                            fused_experts, fused_experts_310p,
-                                           native_grouped_topk,
-                                           quant_per_tensor, select_experts)
+                                           quant_per_tensor)
 
 
 class TestQuantPerTensor(TestBase):
@@ -718,12 +719,12 @@ class TestSelectExperts(TestBase):
     def test_softmax_scoring(self):
         """Test softmax scoring function"""
 
-        weights, ids = select_experts(hidden_states=self.hidden_states,
-                                      router_logits=self.router_logits,
-                                      top_k=self.top_k,
-                                      use_grouped_topk=False,
-                                      renormalize=False,
-                                      scoring_func="softmax")
+        weights, ids, _ = select_experts(hidden_states=self.hidden_states,
+                                         router_logits=self.router_logits,
+                                         top_k=self.top_k,
+                                         use_grouped_topk=False,
+                                         renormalize=False,
+                                         scoring_func="softmax")
 
         self.assertEqual(weights.shape, (self.num_tokens, self.top_k))
         self.assertEqual(ids.shape, (self.num_tokens, self.top_k))
@@ -731,12 +732,12 @@ class TestSelectExperts(TestBase):
     def test_sigmoid_scoring(self):
         """Test sigmoid scoring function"""
 
-        weights, ids = select_experts(hidden_states=self.hidden_states,
-                                      router_logits=self.router_logits,
-                                      top_k=self.top_k,
-                                      use_grouped_topk=False,
-                                      renormalize=False,
-                                      scoring_func="sigmoid")
+        weights, ids, _ = select_experts(hidden_states=self.hidden_states,
+                                         router_logits=self.router_logits,
+                                         top_k=self.top_k,
+                                         use_grouped_topk=False,
+                                         renormalize=False,
+                                         scoring_func="sigmoid")
 
         self.assertEqual(weights.shape, (self.num_tokens, self.top_k))
         self.assertEqual(ids.shape, (self.num_tokens, self.top_k))
@@ -759,27 +760,27 @@ class TestSelectExperts(TestBase):
                                               self.top_k,
                                               dtype=torch.long))
 
-        weights, ids = select_experts(hidden_states=self.hidden_states,
-                                      router_logits=self.router_logits,
-                                      top_k=self.top_k,
-                                      use_grouped_topk=True,
-                                      renormalize=False,
-                                      topk_group=4,
-                                      num_expert_group=2)
+        weights, ids, _ = select_experts(hidden_states=self.hidden_states,
+                                         router_logits=self.router_logits,
+                                         top_k=self.top_k,
+                                         use_grouped_topk=True,
+                                         renormalize=False,
+                                         topk_group=4,
+                                         num_expert_group=2)
 
         mock_topk.assert_called()
         self.assertEqual(weights.shape, (self.num_tokens, self.top_k))
         self.assertEqual(ids.shape, (self.num_tokens, self.top_k))
         self.assertEqual(ids.dtype, torch.int32)
 
-    @patch('vllm_ascend.quantization.w8a8.native_grouped_topk')
+    @patch('vllm_ascend.ops.layers.experts_selector._native_grouped_topk')
     def test_grouped_topk_with_correction_bias(self, mock_grouped_topk):
         """Test grouped topk with expert score correction bias"""
         mock_grouped_topk.return_value = torch.ones(self.num_tokens,
                                                     self.num_experts)
 
         e_score_correction_bias = torch.randn(self.num_experts)
-        weights, ids = select_experts(
+        weights, ids, _ = select_experts(
             hidden_states=self.hidden_states,
             router_logits=self.router_logits,
             top_k=self.top_k,
@@ -802,7 +803,7 @@ class TestSelectExperts(TestBase):
                                                         self.top_k,
                                                         dtype=torch.int32))
 
-        weights, ids = select_experts(
+        weights, ids, _ = select_experts(
             hidden_states=self.hidden_states,
             router_logits=self.router_logits,
             top_k=self.top_k,
@@ -823,7 +824,7 @@ class TestSelectExperts(TestBase):
                                               self.top_k,
                                               dtype=torch.long))
 
-        weights, _ = select_experts(
+        weights, ids, _ = select_experts(
             hidden_states=self.hidden_states,
             router_logits=self.router_logits,
             top_k=self.top_k,
@@ -843,7 +844,7 @@ class TestSelectExperts(TestBase):
                                               self.top_k,
                                               dtype=torch.long))
 
-        weights, ids = select_experts(
+        weights, ids, _ = select_experts(
             hidden_states=self.hidden_states,
             router_logits=self.router_logits,
             top_k=self.top_k,
@@ -868,9 +869,9 @@ class TestNativeGroupedTopkPartialMock(TestBase):
 
         with patch('torch.topk',
                    return_value=(None, expected_topk_indices)) as mock_topk:
-            result = native_grouped_topk(topk_weights=topk_weights,
-                                         num_expert_group=2,
-                                         topk_group=2)
+            result = _native_grouped_topk(topk_weights=topk_weights,
+                                          num_expert_group=2,
+                                          topk_group=2)
 
             mock_topk.assert_called_once()
 
@@ -885,9 +886,9 @@ class TestNativeGroupedTopkPartialMock(TestBase):
         expected_topk_indices = torch.tensor([[0], [1]])
 
         with patch('torch.topk', return_value=(None, expected_topk_indices)):
-            result = native_grouped_topk(topk_weights=topk_weights,
-                                         num_expert_group=2,
-                                         topk_group=1)
+            result = _native_grouped_topk(topk_weights=topk_weights,
+                                          num_expert_group=2,
+                                          topk_group=1)
 
             expected_result = torch.tensor(
                 [[0.1, 0.9, 0.2, 0.8, 0.0, 0.0, 0.0, 0.0],
@@ -900,7 +901,7 @@ class TestNativeGroupedTopkPartialMock(TestBase):
         expected_topk_indices = torch.tensor([[0], [0]])
 
         with patch('torch.topk', return_value=(None, expected_topk_indices)):
-            result = native_grouped_topk(topk_weights=topk_weights,
-                                         num_expert_group=1,
-                                         topk_group=1)
+            result = _native_grouped_topk(topk_weights=topk_weights,
+                                          num_expert_group=1,
+                                          topk_group=1)
             self.assertTrue(result.numel() > 0)
