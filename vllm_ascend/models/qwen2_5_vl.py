@@ -42,7 +42,12 @@ from vllm.model_executor.models.qwen2_5_vl import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, is_enable_nz,
+                               vllm_version_is)
+
+if not vllm_version_is("0.11.0"):
+    from vllm.model_executor.models.vision import conv3d_to_linear_weight
 
 MIN_PAD_SIZE = 64  # min_size to pad weight
 MAX_PAD_SIZE = 128  # max_size to pad weight
@@ -283,6 +288,14 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
             [qkv_weight_first_half_padded, qkv_weight_second_half_padded],
             dim=2)
         qkv_weight_final = qkv_weight_padded.reshape(-1, self.hidden_size)
+
+        if is_enable_nz():
+            qkv_weight_final_copy = torch.empty_like(qkv_weight_final).copy_(
+                qkv_weight_final)
+            qkv_weight_final_copy = torch_npu.npu_format_cast(
+                qkv_weight_final_copy, ACL_FORMAT_FRACTAL_ND)
+            return qkv_weight_final_copy
+
         return qkv_weight_final
 
     def pad_proj_weight(self, data):
@@ -291,6 +304,13 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
                          self.half_origin_hidden_size_per_attention_head),
             (0, self.half_pad_hidden_size_per_attention_head, 0, 0)).reshape(
                 self.hidden_size, -1)
+
+        if is_enable_nz():
+            out_weight_copy = torch.empty_like(out_weight).copy_(out_weight)
+            out_weight_copy = torch_npu.npu_format_cast(
+                out_weight_copy, ACL_FORMAT_FRACTAL_ND)
+            return out_weight_copy
+
         return out_weight
 
     def pad_qkv_weight_scale_offset(self, data):
@@ -340,6 +360,9 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if not vllm_version_is("0.11.0"):
+                if name.endswith("patch_embed.proj.weight"):
+                    loaded_weight = conv3d_to_linear_weight(loaded_weight)
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -498,20 +521,12 @@ class AscendQwen2_5_VLForConditionalGeneration(
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config: Qwen2_5_VLConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        if vllm_version_is("0.10.2"):
-            self.visual = AscendQwen2_5_VisionTransformer(
-                vision_config=config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "visual"),
-            )
-        else:
-            self.visual = AscendQwen2_5_VisionTransformer(
-                vision_config=config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        self.visual = AscendQwen2_5_VisionTransformer(
+            vision_config=config.vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "visual"),
+        )
 
     def _process_image_input(self, image_input) -> tuple[torch.Tensor, ...]:
 
@@ -522,7 +537,11 @@ class AscendQwen2_5_VLForConditionalGeneration(
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            if vllm_version_is("0.11.0"):
+                image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            else:
+                with set_ascend_forward_context(None, self.vllm_config):
+                    image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
@@ -539,7 +558,13 @@ class AscendQwen2_5_VLForConditionalGeneration(
         else:
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype)
-            video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
+            if vllm_version_is("0.11.0"):
+                video_embeds = self.visual(pixel_values_videos,
+                                           grid_thw=grid_thw)
+            else:
+                with set_ascend_forward_context(None, self.vllm_config):
+                    video_embeds = self.visual(pixel_values_videos,
+                                               grid_thw=grid_thw)
 
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size

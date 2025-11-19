@@ -31,7 +31,7 @@ import torch
 import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.attention import Attention, AttentionMetadata
+from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
@@ -69,12 +69,68 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.models.layers.sfa import Indexer
+from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.torchair.ops.torchair_fused_moe import TorchairAscendFusedMoE
 from vllm_ascend.torchair.quantization.torchair_w8a8_dynamic import \
     TorchairAscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import dispose_tensor, npu_prefetch, oproj_tp_enable
+from vllm_ascend.utils import dispose_tensor, oproj_tp_enable, vllm_version_is
+
+if vllm_version_is("0.11.0"):
+    from vllm.attention import Attention
+else:
+    from vllm.attention.layer import MLAAttention
+
+
+class Indexer(nn.Module):
+
+    def __init__(self,
+                 config,
+                 dim: int = 7168,
+                 n_heads: int = 64,
+                 head_dim: int = 128,
+                 index_topk: int = 2048,
+                 q_lora_rank: int = 1536,
+                 rope_head_dim: int = 64,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: Optional[str] = ""):
+        super().__init__()
+
+        self.dim: int = dim  # 7168
+        self.n_heads: int = n_heads  # 64
+        self.head_dim: int = head_dim  # 128
+        self.rope_head_dim: int = rope_head_dim  # 64
+        self.index_topk: int = index_topk  # 2048
+        self.q_lora_rank: int = q_lora_rank  # 1536
+        self.wq_b = ReplicatedLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+            return_bias=False,
+        )
+        self.wk = ReplicatedLinear(
+            self.dim,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wk",
+            return_bias=False,
+        )
+        self.weights_proj = ReplicatedLinear(
+            self.dim,
+            self.n_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.weights_proj",
+            return_bias=False,
+        )
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.softmax_scale = self.head_dim**-0.5
+
+    def forward(self):
+        return
 
 
 class TorchairDeepseekV2SiluAndMul(SiluAndMul):
@@ -161,12 +217,13 @@ class TorchairDeepseekV2RowParallelLinearReplaceAllreduce(RowParallelLinear):
         output_parallel = self.quant_method.apply(self,
                                                   input_parallel,
                                                   bias=bias_)
+        forward_context = get_forward_context()
         if self.reduce_results and self.tp_size > 1:
             num_tokens = output_parallel.shape[0]
             if is_force_scatter and num_tokens % self.tp_size:
                 output_parallel = nn.functional.pad(
                     output_parallel, (0, 0, 0, -num_tokens % self.tp_size))
-            if is_force_scatter or (not is_prefill
+            if is_force_scatter or (not forward_context.with_prefill
                                     and output_parallel.shape[0] % self.tp_size
                                     == 0):
                 output = tensor_model_parallel_reduce_scatter(output_parallel,
@@ -326,14 +383,22 @@ class TorchairDeepseekV2MoE(nn.Module):
             ascend_config.multistream_overlap_shared_expert and \
             self.torchair_graph_enabled
 
+        self.enable_super_kernel = ascend_config.torchair_graph_config.enable_super_kernel
+        self.params_dtype = torch.float32 if self.enable_super_kernel else \
+            torch.get_default_dtype()
+        # Converting gate weight to fp32 is to adapt to the super kernel feature.
+        # Super kernel feature currently cannot fuse operators such as cast, stridedslice, and add.
+        # In the moe stage, Cast will interrupt the fusion of the super kernel. To avoid this problem,
+        # modifications will be made in the initialization stage.
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.n_routed_experts,
                                      bias=False,
                                      quant_config=None,
+                                     params_dtype=self.params_dtype,
                                      prefix=f"{prefix}.gate")
         if config.topk_method == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts))
+                torch.empty(config.n_routed_experts, dtype=self.params_dtype))
         else:
             self.gate.e_score_correction_bias = None
 
@@ -551,29 +616,67 @@ class TorchairDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         #     k_c.size(1) + k_pe.size(1) == kv_cache.size(2)
         # i.e.
         #     kv_lora_rank + qk_rope_head_dim == head_size
-        self.mla_attn = Attention(
-            num_heads=self.num_local_heads,
-            head_size=self.kv_lora_rank + self.qk_rope_head_dim,
-            scale=self.scaling,
-            num_kv_heads=1,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            use_mla=True,
-            # MLA Args
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-            rotary_emb=self.rotary_emb,
-            q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
-            kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
-            kv_a_layernorm=self.kv_a_layernorm,
-            kv_b_proj=self.kv_b_proj,
-            o_proj=self.o_proj,
-        )
+        if vllm_version_is("0.11.0"):
+            self.mla_attn = Attention(
+                num_heads=self.num_local_heads,
+                head_size=self.kv_lora_rank + self.qk_rope_head_dim,
+                scale=self.scaling,
+                num_kv_heads=1,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                use_mla=True,
+                use_sparse=False,
+                indexer=None,
+                # SFA Args
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
+                rotary_emb=self.rotary_emb,
+                q_a_proj=self.q_a_proj
+                if self.q_lora_rank is not None else None,
+                q_a_layernorm=self.q_a_layernorm
+                if self.q_lora_rank is not None else None,
+                q_proj=self.q_proj
+                if self.q_lora_rank is None else self.q_b_proj,
+                kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                o_proj=self.o_proj,
+                decoder_layer=decoder_layer,
+            )
+        else:
+            self.mla_attn = MLAAttention(
+                num_heads=self.num_local_heads,
+                scale=self.scaling,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                use_sparse=False,
+                indexer=None,
+                # MLA Args
+                rotary_emb=self.rotary_emb,
+                q_a_proj=self.q_a_proj
+                if self.q_lora_rank is not None else None,
+                q_a_layernorm=self.q_a_layernorm
+                if self.q_lora_rank is not None else None,
+                q_proj=self.q_proj
+                if self.q_lora_rank is None else self.q_b_proj,
+                q_b_proj=self.q_b_proj
+                if self.q_lora_rank is not None else None,
+                kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                o_proj=self.o_proj,
+            )
 
     def forward(
             self,
@@ -588,9 +691,9 @@ class TorchairDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                   and attn_metadata.num_decodes > 0)
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         if self.q_lora_rank is not None:
-            npu_prefetch(self.q_a_proj.weight,
-                         hidden_states,
-                         enabled=enable_multistream_mla)
+            maybe_npu_prefetch(self.q_a_proj.weight,
+                               hidden_states,
+                               enabled=enable_multistream_mla)
             ckq = self.q_a_proj(hidden_states)[0]
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
             forward_kwargs['ckq'] = ckq
@@ -780,35 +883,65 @@ class TorchairDeepseekV2SFAAttention(DeepseekV2MLAAttention):
             prefix=f"{prefix}.indexer",
         )
 
-        self.sfa_attn = Attention(
-            num_heads=self.num_local_heads,
-            head_size=self.kv_lora_rank + self.qk_rope_head_dim,
-            scale=self.scaling,
-            num_kv_heads=1,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            use_mla=True,
-            use_sfa=True,
-            # SFA Args
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-            rotary_emb=self.rotary_emb,
-            q_a_proj=self.q_a_proj if self.q_lora_rank is not None else None,
-            q_a_layernorm=self.q_a_layernorm
-            if self.q_lora_rank is not None else None,
-            q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
-            kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
-            kv_a_layernorm=self.kv_a_layernorm,
-            kv_b_proj=self.kv_b_proj,
-            o_proj=self.o_proj,
-            indexer=self.indexer,
-            decoder_layer=decoder_layer,
-        )
+        if vllm_version_is("0.11.0"):
+            self.sfa_attn = Attention(
+                num_heads=self.num_local_heads,
+                head_size=self.kv_lora_rank + self.qk_rope_head_dim,
+                scale=self.scaling,
+                num_kv_heads=1,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                use_mla=True,
+                use_sparse=True,
+                indexer=self.indexer,
+                # SFA Args
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
+                rotary_emb=self.rotary_emb,
+                q_a_proj=self.q_a_proj
+                if self.q_lora_rank is not None else None,
+                q_a_layernorm=self.q_a_layernorm
+                if self.q_lora_rank is not None else None,
+                q_proj=self.q_proj
+                if self.q_lora_rank is None else self.q_b_proj,
+                kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                o_proj=self.o_proj,
+                decoder_layer=decoder_layer,
+            )
+        else:
+            self.sfa_attn = MLAAttention(
+                num_heads=self.num_local_heads,
+                scale=self.scaling,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                use_sparse=True,
+                indexer=self.indexer,
+                # MLA Args
+                rotary_emb=self.rotary_emb,
+                q_a_proj=self.q_a_proj
+                if self.q_lora_rank is not None else None,
+                q_a_layernorm=self.q_a_layernorm
+                if self.q_lora_rank is not None else None,
+                q_proj=self.q_proj
+                if self.q_lora_rank is None else self.q_b_proj,
+                kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
+                kv_a_layernorm=self.kv_a_layernorm,
+                kv_b_proj=self.kv_b_proj,
+                o_proj=self.o_proj,
+            )
 
     def forward(
             self,
@@ -877,12 +1010,12 @@ class TorchairDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
         self.use_mla = False
-        self.use_sfa = False
+        self.use_sparse = False
         # TODO: enable mla in vllm-ascend
         if model_config.use_mla:
-            if ascend_config.use_sfa:
+            if hasattr(model_config.hf_config, "index_topk"):
                 attn_cls = TorchairDeepseekV2SFAAttention
-                self.use_sfa = True
+                self.use_sparse = True
             else:
                 attn_cls = TorchairDeepseekV2MLAAttention  # type: ignore[assignment]
             self.use_mla = True
@@ -945,15 +1078,15 @@ class TorchairDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         replace_allreduce: bool = False,
     ) -> torch.Tensor:
         # Self Attention
+        forward_context = get_forward_context()
         if attn_metadata is not None:
             decoding_condition_met = (
-                not attn_metadata.is_prefill if self.use_sfa else
-                attn_metadata.num_decodes > 0 if self.use_mla else False)
+                not attn_metadata.is_prefill if self.use_sparse else
+                not forward_context.with_prefill if self.use_mla else False)
             mla_moe_communication = decoding_condition_met and self.mla_moe_communication and replace_allreduce
         else:
             mla_moe_communication = False
 
-        forward_context = get_forward_context()
         if (envs.VLLM_ASCEND_ENABLE_MLAPO
                 and isinstance(self.self_attn, TorchairDeepseekV2SFAAttention)
                 and attn_metadata is not None
@@ -973,7 +1106,7 @@ class TorchairDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 # to save npu memory because they're no longer used.
                 dispose_tensor(previous_hidden_states)
                 dispose_tensor(previous_residual)
-        if mla_moe_communication and self.layer_idx > self.first_k_dense_replace:
+        if mla_moe_communication and self.layer_idx > self.first_k_dense_replace and self.layer_idx < self.layers:
             hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                              dim=0)
 
@@ -1032,7 +1165,7 @@ class TorchairDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             # The scaling of DeepseekV2MOE output would be done in the forward
             # of DeepseekV2MOE
             hidden_states *= 1. / self.routed_scaling_factor
-        if mla_moe_communication and self.layer_idx == self.layers - 1:
+        if mla_moe_communication and self.layer_idx >= self.layers - 1:
             hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                              dim=0)
             residual = tensor_model_parallel_all_gather(residual, dim=0)
